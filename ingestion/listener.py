@@ -9,16 +9,16 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.config import get_config
 from common.db import get_pool, close_pool, init_pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("AuraListener")
 
-load_dotenv()
-
-api_id = int(os.environ["TELEGRAM_API_ID"])
-api_hash = os.environ["TELEGRAM_API_HASH"]
-session_string = os.environ["TELEGRAM_SESSION_STRING"]
+cfg = get_config()
+api_id = cfg.telegram_api_id
+api_hash = cfg.telegram_api_hash
+session_string = cfg.telegram_session_string
 
 # ANTI-DETECTION: Spoof a real Samsung Galaxy S24 running Telegram 10.14.5
 # These strings match Telegram's official Android app over MTProto exactly.

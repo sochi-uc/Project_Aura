@@ -3,35 +3,31 @@ import os
 import sys
 import logging
 import json
-import random
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.config import get_config
 from common.db import get_pool, close_pool
-from common.llm import call_gemini
+from common.llm import call_llm
+from common.embeddings import get_embedding_provider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("AuraWorker")
 
-load_dotenv()
+cfg = get_config()
+BATCH_SIZE = cfg.batch_size
+SIMILARITY_THRESHOLD_LOW = cfg.similarity_threshold_low
+SIMILARITY_THRESHOLD_HIGH = cfg.similarity_threshold_high
 
-logger.info("Loading embedding model (this may take a moment)...")
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-BATCH_SIZE = 50
-SIMILARITY_THRESHOLD_LOW = 0.65  # Send to LLM
-SIMILARITY_THRESHOLD_HIGH = 0.65 # Auto-approve
 
 async def evaluate_borderline_messages(conn, candidates):
     """
-    Takes borderline candidates, batches them to Gemini to confirm relevance.
+    Takes borderline candidates and batches them to the configured LLM to confirm relevance.
     candidates: list of dicts { 'msg_id', 'text', 'topic_id', 'topic_label' }
     """
     if not candidates:
         return
 
-    # Group by topic for better LLM prompting
+    # Group by topic for structured prompting
     topics_dict = {}
     for c in candidates:
         if c["topic_label"] not in topics_dict:
@@ -42,7 +38,7 @@ async def evaluate_borderline_messages(conn, candidates):
         prompt = f"You are evaluating if messages are relevant to the topic: '{topic_label}'.\n\n"
         for m in msgs:
             prompt += f"<message id=\"{m['msg_id']}\">{m['text']}</message>\n"
-            
+
         prompt += """
 Respond in pure JSON with this exact schema:
 {
@@ -52,17 +48,15 @@ Respond in pure JSON with this exact schema:
 }
 """
         try:
-            logger.info(f"Asking Gemini about {len(msgs)} messages for topic '{topic_label}'...")
-            res_text = await call_gemini(prompt, is_json=True, max_tokens=4096)
+            logger.info(f"Asking LLM ({cfg.llm_provider}) about {len(msgs)} messages for topic '{topic_label}'...")
+            res_text = await call_llm(prompt, is_json=True, max_tokens=4096)
             data = json.loads(res_text)
-            
+
             for item in data.get("results", []):
                 msg_id = int(item["id"])
                 relevant = bool(item["relevant"])
                 reason = item.get("reason", "")
-                
-                # Update DB
-                # Find the candidate matching this msg_id
+
                 cand = next((c for c in msgs if c["msg_id"] == msg_id), None)
                 if cand:
                     await conn.execute("""
@@ -71,12 +65,12 @@ Respond in pure JSON with this exact schema:
                         ON CONFLICT (message_row_id, topic_id) DO UPDATE 
                         SET llm_confirmed = EXCLUDED.llm_confirmed, llm_reason = EXCLUDED.llm_reason
                     """, msg_id, cand["topic_id"], cand["similarity"], relevant, reason)
-                    
+
         except Exception as e:
             logger.error(f"Failed LLM eval for topic '{topic_label}': {e}")
 
 
-async def process_batch(pool):
+async def process_batch(pool, embedder):
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch(f"""
@@ -90,47 +84,45 @@ async def process_batch(pool):
                 FOR UPDATE SKIP LOCKED 
                 LIMIT {BATCH_SIZE}
             """)
-            
+
             if not rows:
                 return 0
-                
+
             row_ids = [r['id'] for r in rows]
             await conn.execute("UPDATE raw_messages SET processing_started_at = now() WHERE id = ANY($1)", row_ids)
-            
+
     logger.info(f"Processing batch of {len(rows)} messages...")
-    
+
     candidates_for_llm = []
-    
+
     async with pool.acquire() as conn:
-        topics = await conn.fetch("SELECT id, label, embedding FROM interest_topics WHERE active = TRUE")
-        
         for row in rows:
             msg_id = row["id"]
             text = row["text"]
-            
-            embedding = embedding_model.encode([text])[0].tolist()
-            embedding_str = f"[{','.join(map(str, embedding))}]"
-            
+
+            embedding = embedder.get_embedding(text)
+            embedding_str = embedder.to_vector_sql(embedding)
+
             async with conn.transaction():
                 await conn.execute("""
                     INSERT INTO message_embeddings (message_row_id, embedding)
                     VALUES ($1, $2::vector)
                     ON CONFLICT (message_row_id) DO UPDATE SET embedding = EXCLUDED.embedding
                 """, msg_id, embedding_str)
-                
-                # Check pgvector cosine similarity vs topics directly in SQL!
+
+                # Check pgvector cosine similarity vs topics directly in SQL
                 sim_rows = await conn.fetch("""
                     SELECT id, label, 1 - (embedding <=> $1::vector) as similarity
                     FROM interest_topics
                     WHERE active = TRUE
                 """, embedding_str)
-                
+
                 for sr in sim_rows:
                     sim = sr["similarity"]
                     topic_id = sr["id"]
-                    
+
                     if sim >= SIMILARITY_THRESHOLD_HIGH:
-                        # Auto-approve!
+                        # Auto-approve
                         await conn.execute("""
                             INSERT INTO message_relevance (message_row_id, topic_id, similarity, llm_confirmed, llm_reason)
                             VALUES ($1, $2, $3, TRUE, 'Auto-approved due to high vector similarity')
@@ -145,27 +137,30 @@ async def process_batch(pool):
                             "topic_label": sr["label"],
                             "similarity": sim
                         })
-                
+
                 await conn.execute("UPDATE raw_messages SET processed_at = now() WHERE id = $1", msg_id)
-                
-    # Run LLM batch check for candidates
+
+    # Run LLM batch check for borderline candidates
     async with pool.acquire() as conn:
         await evaluate_borderline_messages(conn, candidates_for_llm)
-                
+
     return len(rows)
+
 
 async def main():
     pool = await get_pool()
+    embedder = get_embedding_provider()
     total = 0
     for _ in range(10):
-        count = await process_batch(pool)
+        count = await process_batch(pool, embedder)
         if count == 0:
             logger.info("Queue empty. Worker exiting.")
             break
         total += count
-    
+
     logger.info(f"Total processed this run: {total}")
     await close_pool()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

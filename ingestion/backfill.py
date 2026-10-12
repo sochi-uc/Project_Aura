@@ -8,16 +8,17 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from common.config import get_config
 from common.db import get_pool, close_pool, init_pool
 from ingestion.listener import upsert_chat
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Backfill")
-load_dotenv()
 
-api_id = int(os.environ["TELEGRAM_API_ID"])
-api_hash = os.environ["TELEGRAM_API_HASH"]
-session_string = os.environ["TELEGRAM_SESSION_STRING"]
+cfg = get_config()
+api_id = cfg.telegram_api_id
+api_hash = cfg.telegram_api_hash
+session_string = cfg.telegram_session_string
 
 client = TelegramClient(StringSession(session_string), api_id, api_hash)
 
