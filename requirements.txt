@@ -6,3 +6,5 @@ groq
 python-dotenv
 pyyaml
 tiktoken
+google-genai
+qrcode

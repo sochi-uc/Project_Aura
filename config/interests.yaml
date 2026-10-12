@@ -4,4 +4,14 @@ topics:
       Discussion of cameras, microphones, lighting, stage setup, livestream
       equipment, video recording, or any technical production logistics
       for a TEDx event.
-
+  - label: "Chapel Electrical & Lighting"
+    description: >
+      Discussion of Avolites Titan Quartz, DMX patching, moving heads, PAR cans,
+      electrical phase balancing, cable runs, or Sunday service lighting cues.
+  - label: "Software Engineering & .NET"
+    description: >
+      Discussion of ASP.NET Core, Minimal APIs, C#, Python, Clean Architecture, 
+      MassTransit, Redis, RabbitMQ, Docker, or database schema design.
+  - label: "Direct mentions"
+    description: >
+      Messages that directly mention, tag, or address you by name or handle.

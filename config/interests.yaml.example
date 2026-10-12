@@ -1,0 +1,13 @@
+# Define topics of interest for the Project Aura worker to monitor and score
+topics:
+  - label: "Technology & Software Engineering"
+    description: >
+      Discussions about software engineering, system architecture, programming languages
+      (Python, C#, Rust, Go), APIs, microservices, databases, and DevOps.
+  - label: "Important Announcements & Events"
+    description: >
+      Key organizational updates, scheduled meetings, venue bookings, production schedules,
+      and critical deadlines.
+  - label: "Direct Mentions"
+    description: >
+      Messages that explicitly mention or direct questions to you by name or username.

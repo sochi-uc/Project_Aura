@@ -1,0 +1,17 @@
+[Unit]
+Description=Project Aura - Telegram Ingestion Listener
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace YOUR_USER and /path/to/Project_Aura with your actual username and directory
+User=YOUR_USER
+WorkingDirectory=/path/to/Project_Aura
+EnvironmentFile=/path/to/Project_Aura/.env
+ExecStart=/path/to/Project_Aura/venv/bin/python ingestion/listener.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

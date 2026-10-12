@@ -1,6 +1,42 @@
+# Environment & Secrets
 .env
+.env.*
+!.env.example
+
+# Telegram Telethon session strings & files
 *.session
+*.session-journal
+
+# Python Bytecode & Cache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
 venv/
+.venv/
+env/
+ENV/
+
+# Local databases & dumps
 *.sqlite3
+*.db
+*.sql.dump
+*.dump
+
+# Logs & temporary files
+*.log
+/logs/
+
+# IDE & OS Metadata
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Screenshots
+Screenshots/
