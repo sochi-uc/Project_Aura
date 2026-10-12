@@ -1,3 +1,16 @@
+"""
+common/llm.py — Pluggable Multi-Provider LLM Abstraction
+
+Design Rationale:
+- Vendor Agnosticism: Hardcoding calls to a single AI provider (e.g. Gemini) creates
+  tight coupling and vulnerability to upstream rate limits, outages, or pricing shifts.
+  This module abstracts completion behind the `BaseLLMProvider` contract.
+- Resilient Retry Mechanics: All network providers implement exponential backoff with
+  random jitter. This prevents retry storms when hitting 429 quota exhaustion.
+- Backward Compatibility: Existing callers relying on `call_gemini(...)` continue
+  functioning transparently while routing through the decoupled provider engine.
+"""
+
 import asyncio
 import json
 import logging
@@ -12,8 +25,8 @@ logger = logging.getLogger("AuraLLM")
 
 class BaseLLMProvider(ABC):
     """
-    Abstract interface for LLM providers in Project Aura.
-    Decouples business logic from specific cloud providers (Gemini, Groq, OpenAI, etc.).
+    Abstract base interface that all LLM provider adapters must implement.
+    Guarantees a consistent calling convention across proprietary and open-source models.
     """
 
     @abstractmethod
@@ -26,14 +39,22 @@ class BaseLLMProvider(ABC):
         is_json: bool = False,
     ) -> str:
         """
-        Generate text completion from the provider.
+        Execute an asynchronous text completion request.
+
+        Args:
+            prompt: The primary input or user query.
+            system_instruction: Optional persona or directive anchoring the generation.
+            max_tokens: Ceiling for response token length.
+            temperature: Sampling temperature (lower = more deterministic).
+            is_json: Whether the underlying provider should enforce JSON output schema.
         """
         pass
 
 
 class GeminiProvider(BaseLLMProvider):
     """
-    Google Gemini implementation using official google-genai SDK.
+    Google Gemini adapter using the official google-genai SDK.
+    Optimized for high-context synthesis, morning digests, and conversational Q&A.
     """
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
@@ -43,6 +64,7 @@ class GeminiProvider(BaseLLMProvider):
         self._client = None
 
     def _get_client(self):
+        """Lazy initialization of the Gemini SDK client."""
         if self._client is None:
             if not self.api_key:
                 logger.error("GEMINI_API_KEY is not set in environment or configuration!")
@@ -73,8 +95,11 @@ class GeminiProvider(BaseLLMProvider):
 
         config = types.GenerateContentConfig(**config_args)
 
+        # Retry loop with exponential backoff and jitter to survive temporary 429/503 spikes
         for attempt in range(5):
             try:
+                # Run the blocking synchronous SDK call inside asyncio.to_thread
+                # to keep the async event loop responsive.
                 response = await asyncio.to_thread(
                     client.models.generate_content,
                     model=self.model,
@@ -90,6 +115,7 @@ class GeminiProvider(BaseLLMProvider):
 
             except Exception as e:
                 err_str = str(e).lower()
+                # Catch rate limits (429), quota limits, or server transient hiccups (503)
                 if "429" in err_str or "quota" in err_str or "503" in err_str:
                     wait_time = (2 ** attempt) + random.uniform(1, 3)
                     logger.warning(
@@ -105,7 +131,8 @@ class GeminiProvider(BaseLLMProvider):
 
 class GroqProvider(BaseLLMProvider):
     """
-    Groq high-speed inference provider (e.g. Llama 3.3).
+    Groq Cloud adapter using official AsyncGroq client.
+    Ideal for ultra-fast (500+ tokens/sec) evaluation of borderline messages in worker queues.
     """
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
@@ -115,6 +142,7 @@ class GroqProvider(BaseLLMProvider):
         self._client = None
 
     def _get_client(self):
+        """Lazy initialization of AsyncGroq client."""
         if self._client is None:
             if not self.api_key:
                 logger.error("GROQ_API_KEY is not set in environment or configuration!")
@@ -168,7 +196,8 @@ class GroqProvider(BaseLLMProvider):
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     """
-    Generic OpenAI-compatible provider (OpenAI, LocalAI, Ollama, vLLM, OpenRouter).
+    Generic adapter for any OpenAI-compatible HTTP chat completions endpoint.
+    Supports official OpenAI, OpenRouter, LocalAI, vLLM, and Ollama out-of-the-box.
     """
 
     def __init__(
@@ -237,7 +266,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
 class MockLLMProvider(BaseLLMProvider):
     """
-    Deterministic mock provider for unit testing and CI without calling network APIs.
+    Deterministic mock provider for unit test suites and CI pipelines.
+    Generates structured test responses without sending requests over the wire.
     """
 
     async def generate(
@@ -251,12 +281,13 @@ class MockLLMProvider(BaseLLMProvider):
         if is_json:
             return json.dumps({
                 "results": [
-                    {"id": "1", "relevant": True, "reason": "Mock match"}
+                    {"id": "1", "relevant": True, "reason": "Deterministic mock verification"}
                 ]
             })
         return f"[MockLLMResponse] System: {system_instruction} | Prompt: {prompt[:80]}"
 
 
+# Provider cache to prevent instantiating multiple clients for the same target
 _provider_cache: Dict[str, BaseLLMProvider] = {}
 
 
@@ -265,7 +296,8 @@ def get_llm_provider(
     model_name: Optional[str] = None
 ) -> BaseLLMProvider:
     """
-    Factory to retrieve an LLM provider instance based on name or environment configuration.
+    Factory function resolving the requested LLM provider instance.
+    Defaults to the provider declared in application configuration.
     """
     cfg = get_config()
     target_provider = (provider_name or cfg.llm_provider).lower()
@@ -300,8 +332,8 @@ async def call_llm(
     model: Optional[str] = None,
 ) -> str:
     """
-    Generic entrypoint for LLM text completion.
-    Uses the configured default provider unless explicitly overridden.
+    High-level asynchronous completion helper.
+    Routes to the configured active provider unless explicitly overridden.
     """
     llm = get_llm_provider(provider_name=provider, model_name=model)
     return await llm.generate(
@@ -321,8 +353,8 @@ async def call_gemini(
     is_json: bool = False,
 ) -> str:
     """
-    Backward-compatible wrapper for existing callers.
-    Routes to the configured LLM provider.
+    Backward-compatibility shim for legacy callers expecting `call_gemini`.
+    Seamlessly routes through the decoupled provider abstraction.
     """
     return await call_llm(
         prompt=prompt,

@@ -1,7 +1,21 @@
 #!/bin/bash
-# Project Aura - Health Check Utility
+# ==============================================================================
+# scripts/health.sh — Project Aura System Health & Statistics Inspector
+#
+# Design Rationale:
+# - Non-Privileged Telemetry: Older diagnostic scripts frequently relied on
+#   interactive `sudo -u postgres psql` commands which risked password leakage
+#   or required root privileges. This script runs a lightweight, unprivileged
+#   asyncpg probe directly using the credentials declared in `.env`.
+# - Dual-Scope Systemd Inspection: Checks both system-level and user-level systemd
+#   units so services are accurately diagnosed regardless of deployment scope.
+# ==============================================================================
+
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Detect virtual environment Python interpreter if present
 PYTHON_BIN="python3"
 if [ -f "$SCRIPT_DIR/venv/bin/python" ]; then
     PYTHON_BIN="$SCRIPT_DIR/venv/bin/python"
@@ -9,8 +23,9 @@ fi
 
 echo -e "\n🩺 \033[1;36mProject Aura Health Check\033[0m\n"
 
-# 1. Check Systemd Services (User or System scope)
-echo -e "⚙️  \033[1;33mSystemd Services:\033[0m"
+# ── 1. Check Systemd Units ──────────────────────────────────────────────────
+# Iterates core daemons and timers across system and user scopes
+echo -e "⚙️  \033[1;33mSystemd Services & Timers:\033[0m"
 for srv in project-aura aura-bot aura-listener aura-worker.timer aura-digest.timer; do
     if systemctl is-active --quiet "$srv" 2>/dev/null || systemctl --user is-active --quiet "$srv" 2>/dev/null; then
         echo -e "   ✅ $srv: \033[32mActive\033[0m"
@@ -19,17 +34,22 @@ for srv in project-aura aura-bot aura-listener aura-worker.timer aura-digest.tim
     fi
 done
 
-# 2. Check Database Stats
+# ── 2. Database Probe (asyncpg) ─────────────────────────────────────────────
+# Probes PostgreSQL without requiring sudo or interactive psql CLI tools
 echo -e "\n📊 \033[1;33mDatabase Statistics:\033[0m"
 STATS=$("$PYTHON_BIN" -c "
 import asyncio, asyncpg, os
 from dotenv import load_dotenv
+
+# Load local environment configuration
 load_dotenv('$SCRIPT_DIR/.env')
+
 async def probe():
     url = os.environ.get('DATABASE_URL')
     if not url:
         return
     try:
+        # Establish connection with a 5-second timeout to avoid hanging on network partitions
         conn = await asyncpg.connect(url, timeout=5)
         chats = await conn.fetchval('SELECT COUNT(*) FROM chats;')
         msgs = await conn.fetchval('SELECT COUNT(*) FROM raw_messages;')
@@ -39,8 +59,9 @@ async def probe():
         await conn.close()
     except Exception as e:
         print(f'ERR:{e}')
+
 asyncio.run(probe())
-" 2>/dev/null)
+" 2>/dev/null || true)
 
 if [[ "$STATS" == ERR:* ]]; then
     echo -e "   ⚠️  Database Connection Error: ${STATS#ERR:}"

@@ -1,3 +1,23 @@
+"""
+bot/assistant_bot.py — Agentic Conversational Telegram Assistant
+
+Design Rationale:
+- Strict Authorization Gatekeeper: Telegram bots are publicly accessible by default.
+  Every handler immediately validates `update.effective_user.id` against `OWNER_ID`.
+  Unauthorized requests are silently rejected, preventing unauthorized access.
+- Two-Stage Intent & Smart Routing:
+  1. Intent Extraction: Natural user questions (often informal or containing slang)
+     are rewritten into optimized search concepts, extracting target chat filters and time windows.
+  2. Smart Routing:
+     - Group-Specific Queries: When the user asks "what happened in Group X", semantic
+       similarity is replaced with pure chronological retrieval. The user wants the latest
+       conversation flow, not messages that happen to match keywords.
+     - General Topic Queries: Uses hybrid retrieval combining pgvector dense semantic search
+       with PostgreSQL full-text search (BM25) for high recall and keyword precision.
+- Narrative-Driven Synthesis: Rather than cryptic bullet points, the bot produces
+  comprehensive, story-driven analyses with full sender attribution and clickable links.
+"""
+
 import asyncio
 import os
 import sys
@@ -8,6 +28,7 @@ import zoneinfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Ensure repository root is on sys.path for direct script execution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.config import get_config
 from common.db import get_pool
@@ -22,19 +43,28 @@ cfg = get_config()
 BOT_TOKEN = cfg.assistant_bot_token
 OWNER_ID = cfg.telegram_user_id
 
+# Lazy-loaded embedding model for real-time RAG query vectorization
 embedder = get_embedding_provider()
-user_memory = []  # Stores recent conversation history
+
+# In-memory sliding window for recent conversational exchanges
+user_memory = []
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initial greeting handler; validates single-owner authorization."""
     if OWNER_ID and str(update.effective_user.id) != str(OWNER_ID):
         return
     await update.message.reply_text("Project Aura Assistant is online. Send me a question.")
 
 
 async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Diagnostic handler returning live system health, queue sizes, and LLM provider status.
+    Triggered via the /health command.
+    """
     if OWNER_ID and str(update.effective_user.id) != str(OWNER_ID):
         return
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         total_msgs = await conn.fetchval("SELECT COUNT(*) FROM raw_messages")
@@ -42,6 +72,7 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         relevant = await conn.fetchval("SELECT COUNT(*) FROM message_relevance")
         chats = await conn.fetchval("SELECT COUNT(*) FROM chats")
 
+    # Calculate Pacific Time quota reset countdown (standard Google AI Studio reset window)
     try:
         pt_zone = zoneinfo.ZoneInfo("America/Los_Angeles")
         now_pt = datetime.now(pt_zone)
@@ -72,6 +103,14 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def extract_search_intent(query: str, history: str = ""):
+    """
+    Translates colloquial queries and conversational shorthand into structured search parameters.
+
+    Returns a dict with:
+    - 'optimized_search': Expanded semantic keywords for hybrid retrieval.
+    - 'chat_filter': Specific group title if mentioned, else None.
+    - 'time_filter_days': Relative lookback interval in days (e.g. 1, 7, 30), else None.
+    """
     now = datetime.now().strftime("%A, %B %d, %Y")
     prompt = f"""
 You are an elite, highly intelligent search query optimizer. The current date is {now}.
@@ -101,14 +140,23 @@ Few-Shot Examples:
 """
     try:
         res = await call_llm(prompt, is_json=True, max_tokens=4096)
+        # Strip potential markdown fences returned by models despite JSON instruction
         res = res.strip().removeprefix('```json').removeprefix('```').removesuffix('```').strip()
         return json.loads(res)
     except Exception as e:
         logger.error(f"Intent extraction failed: {e}")
+        # Safe fallback: treat the literal query as the search intent without filters
         return {"optimized_search": query, "chat_filter": None, "time_filter_days": None}
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Main conversational pipeline:
+    1. Authenticates sender against OWNER_ID.
+    2. Rewrites query intent via LLM.
+    3. Retrieves context via Smart Routing (Chronological vs. Hybrid RAG).
+    4. Synthesizes long-form response with deep-link citations.
+    """
     if OWNER_ID and str(update.effective_user.id) != str(OWNER_ID):
         logger.warning(f"Unauthorized access attempt from User ID: {update.effective_user.id}")
         return
@@ -116,13 +164,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
     global user_memory
 
-    # Build conversational history (clean Q/A pairs)
+    # Format multi-turn conversational history
     history_text = ""
     for idx, exchange in enumerate(user_memory):
         history_text += f"Q{idx+1}: {exchange['Q']}\nA{idx+1}: {exchange['A']}\n\n"
 
     status_msg = await update.message.reply_text("🧠 Analyzing conversational intent...")
 
+    # Extract structured intent
     intent = await extract_search_intent(user_query, history_text)
     optimized_query = intent.get("optimized_search", user_query)
     chat_filter = intent.get("chat_filter")
@@ -135,8 +184,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # ── SMART ROUTING ────────────────────────────────────────────────────────
+        # Chat-specific queries require chronological ordering, not vector similarity.
+        # General topic queries utilize hybrid vector + full-text search.
         if chat_filter:
-            # Direct chronological fetch for chat-specific inquiries
+            # Mode A: Chronological fetch for target chat
             sql = """
                 SELECT rm.id, rm.text, rm.sent_at, rm.chat_id, rm.message_id,
                        rm.sender_display_name, c.title, c.username,
@@ -158,10 +210,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Chat-specific fetch for '{chat_filter}': {len(rows)} rows found")
 
         else:
-            # Hybrid vector + full-text search
+            # Mode B: Hybrid dense vector + BM25 full-text search
             query_vector = embedder.get_embedding(optimized_query)
             query_vec_str = embedder.to_vector_sql(query_vector)
 
+            # Combines pgvector cosine similarity with PostgreSQL text search matching bonus
             sql = """
                 SELECT rm.id, rm.text, rm.sent_at, rm.chat_id, rm.message_id,
                        rm.sender_display_name, c.title, c.username,
@@ -188,9 +241,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"I couldn't find any relevant messages{time_msg}.")
         return
 
+    # Sort candidates chronologically descending so the LLM sees the newest state first
     rows_sorted = sorted(rows, key=lambda r: r['sent_at'], reverse=True)
     context_rows = rows_sorted[:25]
 
+    # Format synthesis prompt with current date anchor to prevent temporal confusion
     now = datetime.now().strftime("%A, %B %d, %Y %H:%M")
     prompt = (
         f"The current date and time is {now}.\n"
@@ -207,6 +262,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text("✍️ Synthesizing time-aware answer...")
 
     try:
+        # Prompt directive mandating exhaustive, structured narrative responses
         answer = await call_llm(
             prompt,
             system_instruction="""You are Project Aura, an elite, highly intelligent personal assistant with a deep focus on METICULOUS, EXHAUSTIVE, AND HIGHLY COMPREHENSIVE storytelling.
@@ -219,11 +275,12 @@ Guidelines for your responses:
             max_tokens=4096,
         )
 
+        # Substitute citation placeholders with clickable deep links
         for r in context_rows:
             link = build_message_link(r["chat_id"], r["message_id"], r["username"])
             answer = answer.replace(f"[[LINK:{r['id']}]]", f" [↗]({link})")
 
-        # Calculate Context Match Confidence
+        # Visual confidence meter showing vector relevance match
         max_sim = max(r['sim'] for r in context_rows) if context_rows else 0
         pct = min(100, max(0, int(max_sim * 100)))
         filled = min(10, max(0, int(max_sim * 10)))
@@ -231,12 +288,14 @@ Guidelines for your responses:
 
         answer += f"\n\n\n🎯 **Memory Match:** `{pct}%` `[{bar}]`"
 
+        # Telegram Markdown parsing fallback (protects against malformed unclosed tags)
         try:
             await status_msg.edit_text(answer, parse_mode="Markdown", disable_web_page_preview=True)
         except Exception as e:
             logger.warning(f"Telegram Markdown parse failed: {e}")
             await status_msg.edit_text(answer, disable_web_page_preview=True)
 
+        # Maintain 3-turn sliding window memory without metadata noise
         clean_answer = answer.split("\n\n\n🎯")[0].strip()
         user_memory.append({"Q": user_query, "A": clean_answer})
         if len(user_memory) > 3:
@@ -254,6 +313,7 @@ Guidelines for your responses:
 
 
 def main():
+    """Starts the Telegram bot polling loop."""
     if not BOT_TOKEN or not OWNER_ID:
         logger.error("ASSISTANT_BOT_TOKEN or TELEGRAM_USER_ID is missing from environment/config!")
         return
